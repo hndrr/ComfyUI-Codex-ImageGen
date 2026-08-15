@@ -1,4 +1,6 @@
 import json
+import math
+import sys
 from pathlib import Path
 
 import pytest
@@ -8,12 +10,15 @@ from auth_manager import LoginResult
 from auth_manager import resolve_codex_binary
 from auth_manager import build_codex_environment
 from codex_node import CodexExecImageGen
+from codex_text_node import CodexExecText
 from codex_runner import CodexRunner, RunnerOptions, build_codex_exec_command
-from image_io import save_image_tensor_to_comfy_input
+from image_io import save_image_inputs_to_comfy_input, save_image_tensor_to_comfy_input
+from media_io import append_media_notes, audio_to_spectrogram_reference, prepare_media_references
 from output_parser import parse_generated_image_path, parse_last_agent_message
 from path_utils import cleanup_generated_source_image, cleanup_task_dir, copy_generated_image_to_output, create_task_dir, parse_image_paths
 from progress import progress_for_jsonl_event
-from prompt_builder import build_imagegen_prompt
+from prompt_builder import build_codex_prompt, build_imagegen_prompt
+from skill_registry import discover_skill_names, text_skill_options
 
 
 def test_prompt_builder_forces_imagegen_prefix():
@@ -22,6 +27,63 @@ def test_prompt_builder_forces_imagegen_prefix():
     assert build_imagegen_prompt("make a red cube", "16:9") == (
         "$imagegen 画面比例 16:9。make a red cube"
     )
+
+
+def test_prompt_builder_explicitly_adds_selected_skill_by_mode():
+    assert build_codex_prompt("draw", mode="imagegen", skill="imagegen") == "$imagegen draw"
+    assert build_codex_prompt("draw", mode="imagegen", skill="my-style") == (
+        "$my-style\n\n$imagegen draw"
+    )
+    assert build_codex_prompt("summarize", mode="text", skill="auto") == "summarize"
+    assert build_codex_prompt("summarize", mode="text", skill="my-review") == (
+        "$my-review\n\nsummarize"
+    )
+    with pytest.raises(ValueError, match="imagegen skill"):
+        build_codex_prompt("summarize", mode="text", skill="imagegen")
+
+
+def test_skill_registry_discovers_system_and_user_skills(tmp_path):
+    codex_home = tmp_path / "codex"
+    system_skill = codex_home / "skills" / ".system" / "system-helper"
+    user_skill = tmp_path / ".agents" / "skills" / "user-helper"
+    invalid_skill = tmp_path / ".agents" / "skills" / "invalid"
+    for path in (system_skill, user_skill, invalid_skill):
+        path.mkdir(parents=True)
+    (system_skill / "SKILL.md").write_text(
+        "---\nname: system-helper\ndescription: test\n---\n",
+        encoding="utf-8",
+    )
+    (user_skill / "SKILL.md").write_text(
+        "---\nname: user-helper\ndescription: test\n---\n",
+        encoding="utf-8",
+    )
+    (invalid_skill / "SKILL.md").write_text(
+        "---\nname: invalid skill name\ndescription: test\n---\n",
+        encoding="utf-8",
+    )
+
+    names = discover_skill_names(user_home=tmp_path, codex_homes=[codex_home])
+
+    assert names[0] == "auto"
+    assert "imagegen" in names
+    assert "system-helper" in names
+    assert "user-helper" in names
+    assert "invalid skill name" not in names
+
+
+def test_developer_instruction_is_a_separate_codex_config_value():
+    command = build_codex_exec_command(
+        RunnerOptions(
+            prompt="Change the outfit.",
+            developer_instructions='Keep the "face" identical.\nPreserve identity.',
+        )
+    )
+
+    assert (
+        'developer_instructions="Keep the \\"face\\" identical.\\nPreserve identity."'
+        in command
+    )
+    assert command[-1] == "$imagegen Change the outfit."
 
 
 def test_resolve_codex_binary_uses_env_path(tmp_path, monkeypatch):
@@ -82,9 +144,10 @@ def test_build_codex_command_uses_only_supported_flags(tmp_path):
     last_message = tmp_path / "last_message.txt"
     options = RunnerOptions(
         prompt="draw",
+        developer_instructions="Preserve identity.",
         image_paths=[image],
         aspect_ratio="16:9",
-        model="gpt-5.4",
+        model="gpt-5.6-sol",
         reasoning_effort="high",
         working_directory=tmp_path,
         json_output=True,
@@ -104,9 +167,10 @@ def test_build_codex_command_uses_only_supported_flags(tmp_path):
     assert "--image" in command
     assert str(image) in command
     assert "-m" in command
-    assert "gpt-5.4" in command
+    assert "gpt-5.6-sol" in command
     assert "-c" in command
     assert "model_reasoning_effort=high" in command
+    assert 'developer_instructions="Preserve identity."' in command
     assert "-o" in command
     assert str(last_message) in command
     assert "--skip-git-repo-check" in command
@@ -116,6 +180,15 @@ def test_build_codex_command_uses_only_supported_flags(tmp_path):
     assert "aspect_ratio" not in command
     assert not {"seed", "steps", "cfg", "sampler", "scheduler", "checkpoint"} & set(command)
     assert command[-1] == "$imagegen 画面比例 16:9。draw"
+
+
+def test_build_codex_command_text_mode_never_adds_imagegen():
+    command = build_codex_exec_command(
+        RunnerOptions(prompt="answer briefly", mode="text", skill="openai-docs")
+    )
+
+    assert command[-1] == "$openai-docs\n\nanswer briefly"
+    assert "$imagegen" not in command[-1]
 
 
 def test_task_dir_does_not_create_plugin_input_or_output_dirs(tmp_path):
@@ -204,6 +277,18 @@ def test_save_image_tensor_uses_comfy_input_directory(tmp_path):
     assert saved[0].exists()
 
 
+def test_save_image_inputs_supports_multiple_ports_and_batches(tmp_path):
+    numpy = pytest.importorskip("numpy")
+    first = numpy.ones((1, 2, 3, 3), dtype="float32")
+    second = numpy.ones((2, 4, 5, 3), dtype="float32")
+
+    saved = save_image_inputs_to_comfy_input([first, second], tmp_path / "input", "codex_test")
+
+    assert len(saved) == 3
+    assert len({path.name for path in saved}) == 3
+    assert all(path.exists() for path in saved)
+
+
 def test_copy_generated_image_to_comfy_output_and_cleanup_source(tmp_path):
     source = tmp_path / "codex_home" / "generated_images" / "thread" / "ig_test.png"
     source.parent.mkdir(parents=True)
@@ -275,6 +360,37 @@ def test_runner_returns_structured_failure_when_codex_missing(tmp_path):
     assert "not installed" in result.last_message
 
 
+def test_runner_decodes_codex_streams_as_utf8_on_windows(tmp_path):
+    runner = CodexRunner(
+        codex_binary="codex",
+        runtime_dir=tmp_path / "runtime",
+        comfy_input_dir=tmp_path / "input",
+        comfy_output_dir=tmp_path / "output",
+    )
+    stdout_path = tmp_path / "stdout.jsonl"
+    stderr_path = tmp_path / "stderr.txt"
+
+    exit_code = runner._run_process(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; "
+                "sys.stdout.buffer.write('画像を生成しました'.encode('utf-8')); "
+                "sys.stderr.buffer.write('警告'.encode('utf-8'))"
+            ),
+        ],
+        stdout_path,
+        stderr_path,
+        10,
+        FakeProgress(),
+    )
+
+    assert exit_code == 0
+    assert stdout_path.read_text(encoding="utf-8") == "画像を生成しました"
+    assert stderr_path.read_text(encoding="utf-8") == "警告"
+
+
 def test_runner_defaults_working_directory_to_comfy_output_dir(tmp_path):
     output_dir = tmp_path / "output"
     output_dir.mkdir()
@@ -293,23 +409,88 @@ def test_runner_defaults_working_directory_to_comfy_output_dir(tmp_path):
     assert meta["codex_home"] == str(tmp_path / "runtime" / "codex_home")
 
 
+def test_runner_text_mode_cleans_successful_task_directory(tmp_path, monkeypatch):
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    last_message_path = tmp_path / "text_result.txt"
+    runner = CodexRunner(
+        codex_binary="codex",
+        auth_manager=FakeAuthManager(LoginResult(True, "ok")),
+        runtime_dir=tmp_path / "runtime",
+        comfy_input_dir=tmp_path / "input",
+        comfy_output_dir=output_dir,
+    )
+
+    def fake_run_process(command, stdout_path, stderr_path, timeout_seconds, progress):
+        last_message_path.write_text("plain text result", encoding="utf-8")
+        stdout_path.write_text(
+            '{"type":"item.completed","item":{"type":"agent_message","text":"plain text result"}}',
+            encoding="utf-8",
+        )
+        stderr_path.write_text("", encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(runner, "_run_process", fake_run_process)
+
+    result = runner.run(
+        prompt="answer",
+        mode="text",
+        working_directory=str(output_dir),
+        output_last_message_path=str(last_message_path),
+    )
+
+    assert result.success is True
+    assert result.last_message == "plain text result"
+    assert result.generated_image_path == ""
+    assert not Path(result.task_dir).exists()
+
+
 def test_node_contract_matches_plan():
     inputs = CodexExecImageGen.INPUT_TYPES()
 
+    assert list(inputs["required"]) == [
+        "prompt",
+        "instruction",
+        "skill",
+        "concurrency_count",
+        "aspect_ratio",
+        "model",
+        "reasoning_effort",
+    ]
     assert inputs["required"]["concurrency_count"] == (
         ["1", "2", "3", "4", "5", "6", "7", "8"],
         {"default": "1"},
     )
     assert inputs["required"]["prompt"] == ("STRING", {"multiline": True})
+    assert inputs["required"]["instruction"] == (
+        "STRING",
+        {"multiline": True, "default": ""},
+    )
+    assert inputs["required"]["skill"][0][0] == "auto"
+    assert "imagegen" in inputs["required"]["skill"][0]
     assert inputs["optional"]["images"] == ("IMAGE",)
-    assert inputs["optional"]["model"] == (["gpt-5.4", "gpt-5.5"], {"default": "gpt-5.4"})
-    assert inputs["optional"]["prompt_2"] == ("STRING", {"multiline": True})
-    assert inputs["optional"]["images_8"] == ("IMAGE",)
-    assert inputs["optional"]["aspect_ratio"] == (
+    assert inputs["optional"]["image_8"] == ("IMAGE",)
+    assert inputs["optional"]["audio"] == ("AUDIO",)
+    assert inputs["optional"]["video"] == ("VIDEO",)
+    assert inputs["required"]["aspect_ratio"] == (
         ["none", "1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3"],
         {"default": "none"},
     )
+    assert inputs["required"]["model"] == (
+        ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],
+        {"default": "gpt-5.6-sol"},
+    )
+    assert inputs["required"]["reasoning_effort"] == (
+        ["none", "low", "medium", "high", "xhigh", "max"],
+        {"default": "medium"},
+    )
     assert inputs["optional"]["auto_save_to_output"] == ("BOOLEAN", {"default": False})
+    assert inputs["optional"]["cache_mode"] == (
+        ["reuse", "always_run"],
+        {"default": "reuse"},
+    )
+    assert "prompt_2" not in inputs["optional"]
+    assert "images_2" not in inputs["optional"]
     assert "sandbox_mode" not in inputs["optional"]
     assert CodexExecImageGen.OUTPUT_IS_LIST == (True, False, False, False, False, False, False)
     assert CodexExecImageGen.RETURN_TYPES == (
@@ -330,8 +511,44 @@ def test_node_contract_matches_plan():
         "exit_code",
         "success",
     )
-    assert CodexExecImageGen.NOT_IDEMPOTENT is True
-    assert CodexExecImageGen.IS_CHANGED("prompt") != CodexExecImageGen.IS_CHANGED("prompt")
+    assert not hasattr(CodexExecImageGen, "NOT_IDEMPOTENT")
+    assert CodexExecImageGen.IS_CHANGED(cache_mode="reuse") is False
+    assert math.isnan(CodexExecImageGen.IS_CHANGED(cache_mode="always_run"))
+
+
+def test_text_node_contract_matches_plan():
+    inputs = CodexExecText.INPUT_TYPES()
+
+    assert list(inputs["required"]) == [
+        "prompt",
+        "instruction",
+        "skill",
+        "model",
+        "reasoning_effort",
+    ]
+    assert inputs["required"]["skill"][0][0] == "auto"
+    assert "imagegen" not in inputs["required"]["skill"][0]
+    assert inputs["optional"]["images"] == ("IMAGE",)
+    assert inputs["optional"]["image_8"] == ("IMAGE",)
+    assert inputs["optional"]["audio"] == ("AUDIO",)
+    assert inputs["optional"]["video"] == ("VIDEO",)
+    assert inputs["optional"]["cache_mode"] == (
+        ["reuse", "always_run"],
+        {"default": "reuse"},
+    )
+    assert "concurrency_count" not in inputs["required"]
+    assert "aspect_ratio" not in inputs["required"]
+    assert CodexExecText.RETURN_TYPES == ("STRING", "STRING", "STRING", "INT", "BOOLEAN")
+    assert CodexExecText.RETURN_NAMES == (
+        "text",
+        "raw_jsonl",
+        "used_prompt",
+        "exit_code",
+        "success",
+    )
+    assert not hasattr(CodexExecText, "NOT_IDEMPOTENT")
+    assert CodexExecText.IS_CHANGED(cache_mode="reuse") is False
+    assert math.isnan(CodexExecText.IS_CHANGED(cache_mode="always_run"))
 
 
 def test_node_raises_when_runner_fails(monkeypatch):
@@ -420,9 +637,12 @@ def test_node_cleans_codex_generated_image_when_not_auto_saving(tmp_path, monkey
     assert not generated.parent.exists()
 
 
-def test_node_runs_multiple_prompts_concurrently(tmp_path, monkeypatch):
+def test_node_runs_same_prompt_concurrently_with_shared_references(tmp_path, monkeypatch):
     generated_paths = []
     calls = []
+    numpy = pytest.importorskip("numpy")
+    first_reference = numpy.ones((1, 2, 2, 3), dtype="float32")
+    second_reference = numpy.ones((1, 3, 3, 3), dtype="float32")
 
     class FakeRunner:
         def __init__(self, codex_binary="codex"):
@@ -446,9 +666,11 @@ def test_node_runs_multiple_prompts_concurrently(tmp_path, monkeypatch):
     monkeypatch.setattr("codex_node.CodexRunner", FakeRunner)
 
     image, generated_path, last_message, _, used_prompt, exit_code, success = CodexExecImageGen().execute(
-        "draw 1",
+        "draw",
+        instruction="Preserve identity.",
+        images=first_reference,
+        image_2=second_reference,
         concurrency_count="2",
-        prompt_2="draw 2",
     )
 
     assert len(image) == 2
@@ -460,13 +682,111 @@ def test_node_runs_multiple_prompts_concurrently(tmp_path, monkeypatch):
     assert "[1] $imagegen draw" in used_prompt
     assert exit_code == 0
     assert success is True
-    assert sorted(call["prompt"] for call in calls) == ["draw 1", "draw 2"]
+    assert all(call["prompt"] == "draw" for call in calls)
+    assert all(call["instruction"] == "Preserve identity." for call in calls)
+    assert all(call["mode"] == "imagegen" for call in calls)
+    assert all(call["skill"] == "auto" for call in calls)
+    assert all(
+        call["images"][0] is first_reference and call["images"][1] is second_reference
+        for call in calls
+    )
     assert all(not path.exists() for path in generated_paths)
 
 
-def test_node_requires_prompts_for_selected_concurrency():
-    with pytest.raises(ValueError, match="prompt_2 is required"):
-        CodexExecImageGen().execute("draw 1", concurrency_count="2")
+def test_node_requires_one_prompt_for_all_concurrent_runs():
+    with pytest.raises(ValueError, match="prompt is required"):
+        CodexExecImageGen().execute("", concurrency_count="2")
+
+
+def test_text_node_returns_text_and_diagnostics_with_shared_references(monkeypatch):
+    calls = []
+    numpy = pytest.importorskip("numpy")
+    first_reference = numpy.ones((1, 2, 2, 3), dtype="float32")
+    second_reference = numpy.ones((1, 3, 3, 3), dtype="float32")
+
+    class FakeRunner:
+        def __init__(self, codex_binary="codex"):
+            pass
+
+        def run(self, **kwargs):
+            calls.append(kwargs)
+            result = FakeResult(
+                generated_image_path="",
+                last_message="text answer",
+                exit_code=0,
+                success=True,
+                used_prompt="describe",
+            )
+            result.raw_jsonl = '{"type":"turn.completed"}'
+            return result
+
+    monkeypatch.setattr("codex_text_node.CodexRunner", FakeRunner)
+
+    output = CodexExecText().execute(
+        "describe",
+        instruction="Be precise.",
+        images=first_reference,
+        image_2=second_reference,
+    )
+
+    assert output == (
+        "text answer",
+        '{"type":"turn.completed"}',
+        "describe",
+        0,
+        True,
+    )
+    assert calls[0]["mode"] == "text"
+    assert calls[0]["skill"] == "auto"
+    assert calls[0]["instruction"] == "Be precise."
+    assert calls[0]["images"][0] is first_reference
+    assert calls[0]["images"][1] is second_reference
+
+
+def test_text_node_rejects_imagegen_and_missing_skills():
+    assert "imagegen" not in text_skill_options()
+    with pytest.raises(ValueError, match="imagegen skill"):
+        CodexExecText().execute("describe", skill="imagegen")
+    with pytest.raises(ValueError, match="not available"):
+        CodexExecText().execute("describe", skill="definitely-missing-skill")
+
+
+def test_audio_reference_becomes_spectrogram_and_honest_prompt_note():
+    numpy = pytest.importorskip("numpy")
+    sample_rate = 16_000
+    time = numpy.arange(sample_rate, dtype="float32") / sample_rate
+    waveform = numpy.sin(2 * numpy.pi * 440 * time)[None, None, :]
+
+    spectrogram, duration, returned_rate = audio_to_spectrogram_reference(
+        {"waveform": waveform, "sample_rate": sample_rate}
+    )
+    prompt = append_media_notes(
+        "draw",
+        prepare_media_references([], audio={"waveform": waveform, "sample_rate": sample_rate}).prompt_notes,
+    )
+
+    assert spectrogram.shape == (1, 256, 512, 3)
+    assert duration == pytest.approx(1.0)
+    assert returned_rate == sample_rate
+    assert "spectrogram" in prompt
+    assert "not available natively" in prompt
+
+
+def test_video_reference_samples_at_most_four_chronological_frames():
+    numpy = pytest.importorskip("numpy")
+
+    class Components:
+        images = numpy.arange(10 * 2 * 2 * 3, dtype="float32").reshape(10, 2, 2, 3)
+
+    class FakeVideo:
+        def get_components(self):
+            return Components()
+
+    prepared = prepare_media_references([], video=FakeVideo())
+
+    assert len(prepared.image_inputs) == 1
+    assert prepared.image_inputs[0].shape == (4, 2, 2, 3)
+    assert "4 chronological frames" in prepared.prompt_notes[0]
 
 
 class FakeAuthManager:
@@ -475,6 +795,11 @@ class FakeAuthManager:
 
     def ensure_login(self, interactive=True):
         return self.result
+
+
+class FakeProgress:
+    def update_absolute(self, value, total=None, preview=None):
+        pass
 
 
 class FakeResult:

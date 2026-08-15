@@ -1,203 +1,189 @@
 import { app } from "../../scripts/app.js";
 
-const NODE_CLASS = "CodexExecImageGen";
-const NODE_TITLE = "Codex Exec ImageGen";
-const MAX_CONCURRENCY = 8;
-const hiddenElementStyles = new WeakMap();
+const NODE_CLASSES = new Set(["CodexExecImageGen", "CodexExecText"]);
+const IMAGEGEN_NODE_CLASS = "CodexExecImageGen";
+const MIN_NODE_WIDTH = 460;
+const PROMPT_HEIGHT = 150;
+const INSTRUCTION_HEIGHT = 100;
+const MAX_IMAGE_INPUTS = 8;
 
-function setupWidget(widget) {
-    if (!widget || widget._codexSetup) {
-        return;
+function imageInputNumber(input) {
+    if (input.name === "images") {
+        return 1;
     }
-    widget._codexSetup = true;
-    widget._codexOriginalComputeSize = widget.computeSize;
-    widget._codexOriginalDraw = widget.draw;
+    const match = input.name?.match(/^image_(\d+)$/);
+    return match ? Number.parseInt(match[1], 10) : null;
 }
 
-function setWidgetVisible(widget, visible) {
-    if (!widget) {
-        return;
+function setupDynamicImageInputs(node) {
+    const knownInputs = node._codexAllInputs ?? [];
+    const knownNames = new Set(knownInputs.map((input) => input.name));
+    for (const input of node.inputs ?? []) {
+        if (!knownNames.has(input.name)) {
+            knownInputs.push(input);
+            knownNames.add(input.name);
+        }
     }
-    setupWidget(widget);
-    widget._codexVisible = visible;
-    widget.computeSize = visible ? widget._codexOriginalComputeSize : () => [0, -4];
-    widget.draw = visible ? widget._codexOriginalDraw : () => {};
-    setWidgetDomVisible(widget, visible);
-}
+    node._codexAllInputs = knownInputs;
 
-function setWidgetDomVisible(widget, visible) {
-    for (const element of getWidgetElements(widget)) {
-        setElementVisible(element, visible);
-    }
-    if (widget.linkedWidgets) {
-        for (const linkedWidget of widget.linkedWidgets) {
-            setWidgetDomVisible(linkedWidget, visible);
+    for (const input of node._codexAllInputs) {
+        const number = imageInputNumber(input);
+        if (number !== null) {
+            input.label = `image_${number}`;
         }
     }
 }
 
-function getWidgetElements(widget) {
+function syncConfiguredInputs(node) {
+    setupDynamicImageInputs(node);
+    for (const configured of node.inputs ?? []) {
+        const configuredNumber =
+            configured.name === "images"
+                ? 1
+                : Number.parseInt(configured.name?.match(/^images?_(\d+)$/)?.[1] ?? "", 10);
+        const canonical = Number.isFinite(configuredNumber)
+            ? node._codexAllInputs.find((input) => imageInputNumber(input) === configuredNumber)
+            : node._codexAllInputs.find((input) => input.name === configured.name);
+        if (canonical) {
+            canonical.link = configured.link;
+        }
+    }
+}
+
+function applyDynamicImageInputs(node) {
+    syncConfiguredInputs(node);
+    const imageInputs = node._codexAllInputs
+        .filter((input) => imageInputNumber(input) !== null)
+        .sort((left, right) => imageInputNumber(left) - imageInputNumber(right));
+    const otherInputs = node._codexAllInputs.filter((input) => imageInputNumber(input) === null);
+    const highestConnected = imageInputs.reduce(
+        (highest, input) => (input.link == null ? highest : Math.max(highest, imageInputNumber(input))),
+        0,
+    );
+    const visibleCount = Math.min(MAX_IMAGE_INPUTS, Math.max(1, highestConnected + 1));
+    node.inputs = [...imageInputs.slice(0, visibleCount), ...otherInputs];
+    node.inputs.forEach((input, slotIndex) => {
+        if (input.link == null) {
+            return;
+        }
+        const link = app.graph?.links?.[input.link];
+        if (link) {
+            link.target_slot = slotIndex;
+        }
+    });
+}
+
+function styleMultilineWidget(node, name, height) {
+    const widget = node.widgets?.find((candidate) => candidate.name === name);
+    if (!widget || widget._codexMultilineStyled) {
+        return;
+    }
+    widget._codexMultilineStyled = true;
+
+    const originalComputeSize = widget.computeSize;
+    widget.computeSize = function (width) {
+        const size = originalComputeSize?.call(this, width) ?? [width, height];
+        return [size[0], Math.max(size[1], height)];
+    };
+
     const elements = [
-        widget.element,
         widget.inputEl,
         widget.textarea,
-        widget.domElement,
-    ].filter((element) => element?.style);
-    for (const element of [...elements]) {
-        const domWidget = element.closest?.(".dom-widget");
-        if (domWidget?.style) {
-            elements.push(domWidget);
-        }
+        widget.element?.querySelector?.("textarea"),
+        widget.domElement?.querySelector?.("textarea"),
+    ].filter(Boolean);
+    for (const element of new Set(elements)) {
+        element.style.minHeight = `${height}px`;
+        element.style.height = `${height}px`;
+        element.style.resize = "vertical";
     }
-    return [...new Set(elements)];
 }
 
-function setElementVisible(element, visible) {
-    if (!element?.style) {
-        return;
-    }
-    if (!visible) {
-        if (!hiddenElementStyles.has(element)) {
-            hiddenElementStyles.set(element, {
-                display: element.style.display,
-                visibility: element.style.visibility,
-                pointerEvents: element.style.pointerEvents,
-                opacity: element.style.opacity,
-                width: element.style.width,
-                height: element.style.height,
-                minHeight: element.style.minHeight,
-                maxHeight: element.style.maxHeight,
-                overflow: element.style.overflow,
-            });
-        }
-        element.style.display = "none";
-        element.style.visibility = "hidden";
-        element.style.pointerEvents = "none";
-        element.style.opacity = "0";
-        element.style.width = "0";
-        element.style.height = "0";
-        element.style.minHeight = "0";
-        element.style.maxHeight = "0";
-        element.style.overflow = "hidden";
-        return;
-    }
-
-    const original = hiddenElementStyles.get(element);
-    if (!original) {
-        return;
-    }
-    element.style.display = original.display;
-    element.style.visibility = original.visibility;
-    element.style.pointerEvents = original.pointerEvents;
-    element.style.opacity = original.opacity;
-    element.style.width = original.width;
-    element.style.height = original.height;
-    element.style.minHeight = original.minHeight;
-    element.style.maxHeight = original.maxHeight;
-    element.style.overflow = original.overflow;
-    hiddenElementStyles.delete(element);
-}
-
-function setInputVisible(input, visible) {
-    if (!input) {
-        return;
-    }
-    input._codexHidden = !visible;
-}
-
-function setupInputVisibility(node) {
-    if (node._codexInputsSetup) {
-        return;
-    }
-    node._codexInputsSetup = true;
-    node._codexAllInputs = [...(node.inputs ?? [])];
-}
-
-function applyInputVisibility(node) {
-    setupInputVisibility(node);
-    const visibleInputs = orderVisibleInputsForDisplay(
-        node._codexAllInputs.filter((input) => !input._codexHidden)
-    );
-    const hiddenInputs = node._codexAllInputs.filter((input) => input._codexHidden);
-    for (const input of hiddenInputs) {
-        if (input.link != null) {
-            const link = app.graph.links[input.link];
-            const originNode = link ? app.graph.getNodeById(link.origin_id) : null;
-            if (originNode) {
-                originNode.disconnectOutput(link.origin_slot, node);
-            }
-            input.link = null;
-        }
-    }
-    node.inputs = visibleInputs;
-}
-
-function orderVisibleInputsForDisplay(inputs) {
-    const baseInputs = inputs.filter((input) => !/^images_\d+$/.test(input.name));
-    const numberedImageInputs = inputs
-        .filter((input) => /^images_\d+$/.test(input.name))
-        .sort((a, b) => Number.parseInt(a.name.split("_")[1], 10) - Number.parseInt(b.name.split("_")[1], 10));
-    const imageIndex = baseInputs.findIndex((input) => input.name === "images");
-    if (imageIndex < 0) {
-        return [...baseInputs, ...numberedImageInputs];
-    }
-    return [
-        ...baseInputs.slice(0, imageIndex + 1),
-        ...numberedImageInputs,
-        ...baseInputs.slice(imageIndex + 1),
-    ];
-}
-
-function applyConcurrencyVisibility(node, count) {
-    const visibleCount = Math.max(1, Math.min(MAX_CONCURRENCY, Number.parseInt(count, 10) || 1));
-    setupInputVisibility(node);
-    for (let index = 2; index <= MAX_CONCURRENCY; index += 1) {
-        const visible = index <= visibleCount;
-        setWidgetVisible(node.widgets?.find((widget) => widget.name === `prompt_${index}`), visible);
-        setInputVisible(node._codexAllInputs?.find((input) => input.name === `images_${index}`), visible);
-    }
-    applyInputVisibility(node);
+function applyAskCodexLayout(node) {
+    applyDynamicImageInputs(node);
+    styleMultilineWidget(node, "prompt", PROMPT_HEIGHT);
+    styleMultilineWidget(node, "instruction", INSTRUCTION_HEIGHT);
 
     requestAnimationFrame(() => {
-        node.setSize(node.computeSize());
+        const computed = node.computeSize();
+        node.setSize([Math.max(MIN_NODE_WIDTH, computed[0]), computed[1]]);
         node.setDirtyCanvas(true, true);
         app.graph?.setDirtyCanvas(true, true);
         app.canvas?.setDirty(true, true);
     });
 }
 
-function setupConcurrencyVisibility(node) {
-    const concurrencyWidget = node.widgets?.find((widget) => widget.name === "concurrency_count");
-    if (!concurrencyWidget || concurrencyWidget._codexConcurrencyReady) {
+function scheduleAskCodexLayout(node) {
+    applyAskCodexLayout(node);
+    requestAnimationFrame(() => applyAskCodexLayout(node));
+    setTimeout(() => applyAskCodexLayout(node), 100);
+}
+
+function migrateLegacyWorkflow(info, nodeName) {
+    if (nodeName !== IMAGEGEN_NODE_CLASS) {
+        return;
+    }
+    const values = info?.widgets_values;
+    if (!Array.isArray(values) || values.length < 18 || !/^[1-8]$/.test(String(values[0]))) {
+        if (
+            Array.isArray(values) &&
+            values.length === 11 &&
+            /^[1-8]$/.test(String(values[1]))
+        ) {
+            info.widgets_values = [values[0], "", "auto", ...values.slice(1)];
+        } else if (
+            Array.isArray(values) &&
+            values.length === 12 &&
+            /^[1-8]$/.test(String(values[2]))
+        ) {
+            info.widgets_values = [values[0], values[1], "auto", ...values.slice(2)];
+        }
         return;
     }
 
-    setupInputVisibility(node);
-    concurrencyWidget._codexConcurrencyReady = true;
-    const originalCallback = concurrencyWidget.callback;
-    concurrencyWidget.callback = function (value) {
-        const result = originalCallback?.apply(this, arguments);
-        applyConcurrencyVisibility(node, value);
-        return result;
-    };
-    applyConcurrencyVisibility(node, concurrencyWidget.value);
+    const legacyModel = values[10];
+    info.widgets_values = [
+        values[1],
+        "",
+        "auto",
+        values[0],
+        values[9],
+        legacyModel === "gpt-5.4" || legacyModel === "gpt-5.5" ? "gpt-5.6-sol" : legacyModel,
+        values[11],
+        ...values.slice(12, 18),
+    ];
 }
 
 app.registerExtension({
-    name: "codex.imagegen.dynamic_concurrency",
+    name: "codex.ask_codex_layout",
 
     async beforeRegisterNodeDef(nodeType, nodeData) {
-        if (nodeData.name !== NODE_CLASS && nodeData.display_name !== NODE_TITLE) {
+        if (!NODE_CLASSES.has(nodeData.name)) {
             return;
         }
 
         const originalOnNodeCreated = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function () {
             const result = originalOnNodeCreated?.apply(this, arguments);
-            setTimeout(() => setupConcurrencyVisibility(this), 100);
+            scheduleAskCodexLayout(this);
+            return result;
+        };
+
+        const originalOnConfigure = nodeType.prototype.onConfigure;
+        nodeType.prototype.onConfigure = function (info) {
+            migrateLegacyWorkflow(info, nodeData.name);
+            const result = originalOnConfigure?.apply(this, arguments);
+            scheduleAskCodexLayout(this);
+            return result;
+        };
+
+        const originalOnConnectionsChange = nodeType.prototype.onConnectionsChange;
+        nodeType.prototype.onConnectionsChange = function () {
+            const result = originalOnConnectionsChange?.apply(this, arguments);
+            setTimeout(() => applyAskCodexLayout(this), 0);
             return result;
         };
     },
 });
 
-console.log("[Codex ImageGen] dynamic concurrency extension loaded");
+console.log("[Codex] Ask Codex layout extension loaded");

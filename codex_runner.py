@@ -9,31 +9,34 @@ from pathlib import Path
 
 try:
     from .auth_manager import CodexAuthManager, build_codex_environment, build_codex_not_found_message, resolve_codex_binary
-    from .image_io import save_image_tensor_to_comfy_input
+    from .image_io import save_image_inputs_to_comfy_input
     from .output_parser import parse_generated_image_path, parse_last_agent_message, read_text_if_exists
     from .path_utils import cleanup_task_dir, copy_generated_image_to_output, create_task_dir, get_comfy_input_dir, get_comfy_output_dir, parse_image_paths, resolve_working_directory
     from .progress import create_progress, progress_for_jsonl_event, update_progress
-    from .prompt_builder import ALLOWED_ASPECT_RATIOS, build_imagegen_prompt
+    from .prompt_builder import ALLOWED_ASPECT_RATIOS, ALLOWED_RUN_MODES, build_codex_prompt
 except ImportError:
     from auth_manager import CodexAuthManager, build_codex_environment, build_codex_not_found_message, resolve_codex_binary
-    from image_io import save_image_tensor_to_comfy_input
+    from image_io import save_image_inputs_to_comfy_input
     from output_parser import parse_generated_image_path, parse_last_agent_message, read_text_if_exists
     from path_utils import cleanup_task_dir, copy_generated_image_to_output, create_task_dir, get_comfy_input_dir, get_comfy_output_dir, parse_image_paths, resolve_working_directory
     from progress import create_progress, progress_for_jsonl_event, update_progress
-    from prompt_builder import ALLOWED_ASPECT_RATIOS, build_imagegen_prompt
+    from prompt_builder import ALLOWED_ASPECT_RATIOS, ALLOWED_RUN_MODES, build_codex_prompt
 
 
-ALLOWED_MODELS = ("gpt-5.4", "gpt-5.5")
-ALLOWED_REASONING_EFFORTS = ("low", "medium", "high")
+ALLOWED_MODELS = ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4")
+ALLOWED_REASONING_EFFORTS = ("none", "low", "medium", "high", "xhigh", "max")
 ALLOWED_SANDBOX_MODES = ("read-only", "workspace-write", "danger-full-access")
 
 
 @dataclass
 class RunnerOptions:
     prompt: str
+    developer_instructions: str = ""
+    mode: str = "imagegen"
+    skill: str = "auto"
     image_paths: list[Path] = field(default_factory=list)
     aspect_ratio: str = "none"
-    model: str = "gpt-5.4"
+    model: str = "gpt-5.6-sol"
     reasoning_effort: str = "medium"
     working_directory: Path | None = None
     json_output: bool = True
@@ -81,9 +84,24 @@ def build_codex_exec_command(options: RunnerOptions) -> list[str]:
         command.extend(["--image", ",".join(str(path) for path in options.image_paths)])
     command.extend(["-m", options.model])
     command.extend(["-c", f"model_reasoning_effort={options.reasoning_effort}"])
+    if options.developer_instructions.strip():
+        command.extend(
+            [
+                "-c",
+                "developer_instructions="
+                + json.dumps(options.developer_instructions.strip(), ensure_ascii=False),
+            ]
+        )
     if options.output_last_message_path is not None:
         command.extend(["-o", str(options.output_last_message_path)])
-    command.append(build_imagegen_prompt(options.prompt, options.aspect_ratio))
+    command.append(
+        build_codex_prompt(
+            options.prompt,
+            mode=options.mode,
+            skill=options.skill,
+            aspect_ratio=options.aspect_ratio,
+        )
+    )
     return command
 
 
@@ -107,10 +125,13 @@ class CodexRunner:
     def run(
         self,
         prompt: str,
+        instruction: str = "",
+        mode: str = "imagegen",
+        skill: str = "auto",
         images=None,
         image_paths_text: str = "",
         aspect_ratio: str = "none",
-        model: str = "gpt-5.4",
+        model: str = "gpt-5.6-sol",
         reasoning_effort: str = "medium",
         working_directory: str = "",
         json_output: bool = True,
@@ -126,7 +147,12 @@ class CodexRunner:
         stderr_path = task_dir / "stderr.txt"
         prompt_path = task_dir / "prompt.txt"
         meta_path = task_dir / "meta.json"
-        used_prompt = build_imagegen_prompt(prompt, aspect_ratio)
+        used_prompt = build_codex_prompt(
+            prompt,
+            mode=mode,
+            skill=skill,
+            aspect_ratio=aspect_ratio,
+        )
         prompt_path.write_text(used_prompt, encoding="utf-8")
         progress = create_progress(100)
         update_progress(progress, 5)
@@ -135,10 +161,10 @@ class CodexRunner:
             input_dir = self.comfy_input_dir or get_comfy_input_dir()
             output_dir = self.comfy_output_dir or get_comfy_output_dir()
             parsed_images = parse_image_paths(image_paths_text)
-            tensor_images = save_image_tensor_to_comfy_input(
+            tensor_images = save_image_inputs_to_comfy_input(
                 images,
                 input_dir,
-                f"codex_imagegen_{task_dir.name}",
+                f"codex_{mode}_{task_dir.name}",
             )
             image_paths = [*parsed_images, *tensor_images]
             workdir = resolve_working_directory(working_directory, output_dir)
@@ -161,6 +187,9 @@ class CodexRunner:
 
             options = RunnerOptions(
                 prompt=prompt,
+                developer_instructions=instruction,
+                mode=mode,
+                skill=skill,
                 image_paths=image_paths,
                 aspect_ratio=aspect_ratio,
                 model=model,
@@ -177,13 +206,21 @@ class CodexRunner:
             meta_path.write_text(
                 json.dumps(
                     {
-                        "command": command[:-1] + ["<prompt>"],
+                        "command": [
+                            "developer_instructions=<instruction>"
+                            if value.startswith("developer_instructions=")
+                            else value
+                            for value in command[:-1]
+                        ]
+                        + ["<prompt>"],
                         "task_dir": str(task_dir),
                         "working_directory": str(workdir),
                         "last_message_path": str(last_message_path),
                         "comfy_input_dir": str(input_dir),
                         "comfy_output_dir": str(output_dir),
                         "codex_home": str(self.codex_home),
+                        "mode": mode,
+                        "skill": skill,
                     },
                     ensure_ascii=False,
                     indent=2,
@@ -202,13 +239,15 @@ class CodexRunner:
                 last_message = stderr or f"codex exec failed with exit code {exit_code}."
                 if raw_jsonl:
                     last_message = f"{last_message}\n\nstdout.jsonl:\n{_tail_text(raw_jsonl)}"
-            generated = parse_generated_image_path(
-                last_message,
-                task_dir,
-                output_dir,
-                min_mtime=process_started_at,
-                additional_output_dirs=[self.codex_home / "generated_images"],
-            )
+            generated = ""
+            if mode == "imagegen":
+                generated = parse_generated_image_path(
+                    last_message,
+                    task_dir,
+                    output_dir,
+                    min_mtime=process_started_at,
+                    additional_output_dirs=[self.codex_home / "generated_images"],
+                )
             if generated:
                 update_progress(progress, 95)
                 if auto_save_to_output:
@@ -224,8 +263,11 @@ class CodexRunner:
                 task_dir=str(task_dir),
                 stderr=stderr,
             )
-            if result.success and result.generated_image_path and not _path_is_inside(result.generated_image_path, task_dir):
-                cleanup_task_dir(task_dir)
+            if result.success:
+                if mode == "text":
+                    cleanup_task_dir(task_dir)
+                elif result.generated_image_path and not _path_is_inside(result.generated_image_path, task_dir):
+                    cleanup_task_dir(task_dir)
             return result
         except FileNotFoundError as exc:
             message = str(exc)
@@ -242,9 +284,12 @@ class CodexRunner:
             with stdout_path.open("w", encoding="utf-8") as stdout_file, stderr_path.open("w", encoding="utf-8") as stderr_file:
                 process = subprocess.Popen(
                     command,
+                    stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     env=self.codex_env,
                     bufsize=1,
                 )
@@ -312,6 +357,8 @@ class CodexRunner:
 
 
 def _validate_options(options: RunnerOptions) -> None:
+    if options.mode not in ALLOWED_RUN_MODES:
+        raise ValueError(f"Unsupported Codex run mode: {options.mode}")
     if options.model not in ALLOWED_MODELS:
         raise ValueError(f"Unsupported Codex model: {options.model}")
     if options.aspect_ratio not in ALLOWED_ASPECT_RATIOS:
