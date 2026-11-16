@@ -31,6 +31,8 @@ class CodexAuthManager:
                 [self.codex_binary, "login", "status"],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=self.timeout_seconds,
                 check=False,
                 env=self.env,
@@ -65,6 +67,8 @@ class CodexAuthManager:
             completed = subprocess.run(
                 [self.codex_binary, *args],
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=self.timeout_seconds,
                 check=False,
                 env=self.env,

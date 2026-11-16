@@ -1,6 +1,6 @@
 # ComfyUI-Codex-ImageGen
 
-这是一个 ComfyUI 自定义节点，用于通过官方 Codex CLI 的 `codex exec` 在后台执行图片生成或图片编辑任务。
+这是一个 ComfyUI 自定义节点包，用于通过官方 Codex CLI 的 `codex exec` 执行图片生成、图片编辑或纯文本任务。
 
 本节点只暴露开发计划中列出的 Codex CLI 官方能力，不添加扩散模型参数。不会提供 seed、steps、cfg、sampler、scheduler、checkpoint、vae、controlnet、lora、latent、image_count 等字段。
 
@@ -48,10 +48,11 @@ cd ComfyUI/custom_nodes
 git clone https://github.com/DocWorkBox/ComfyUI-Codex-ImageGen.git
 ```
 
-然后重启 ComfyUI。节点会显示在：
+然后重启 ComfyUI。节点会显示为：
 
 ```text
-Codex/ImageGen -> Codex Exec ImageGen
+Codex/ImageGen -> Codex ImageGen
+Codex -> Codex Text
 ```
 
 ## 前置条件
@@ -106,7 +107,7 @@ codex login
 runtime/codex_home/
 ```
 
-这样不会读取你系统用户目录下的 Codex skills、plugins、config 或 rules，避免 Feishu 等无关插件拖慢或污染执行。Codex CLI 可执行文件仍使用系统已安装的 `codex`。
+运行时继续使用隔离的 Codex Home，不读取用户的 plugins、config 或 rules。Skill SelectBOX 会读取 Codex 内置 SYSTEM Skills 和官方用户目录 `%USERPROFILE%/.agents/skills`；选择的 Skill 通过 `$skill-name` 明确调用。
 
 节点执行前会在这个隔离环境中运行 `codex login status`。如果检测到未登录，会尝试执行 `codex login`，Codex CLI 会按官方流程打开浏览器授权页；如果失败，再回退到 `codex login --device-auth`。首次运行通常需要单独授权一次。
 
@@ -118,30 +119,40 @@ runtime/codex_home/
 $imagegen <你的 prompt>
 ```
 
+- `instruction`：可选，多行文本。填写需要始终遵守的约束；通过 Codex CLI 的 `-c developer_instructions=...` 作为 developer 指令传入，与用户 `prompt` 保持独立。
+- `skill`：单选。`auto` 表示不添加辅助 Skill。列表由 SYSTEM Skills 和 `%USERPROFILE%/.agents/skills` 自动生成；安装新 Skill 后请重新加载或重启 ComfyUI。
+
 如果选择了 `aspect_ratio`，会变成 `$imagegen 画面比例 <比例>。<你的 prompt>`。这里刻意使用单行格式，贴近 Codex CLI 中可直接生图的 `$imagegen 画一只猫` 用法。
 
-- `concurrency_count`：并发任务数量。可选 `1` 到 `8`，默认 `1`。选择大于 `1` 时，节点会显示对应数量的 `prompt_n` 和 `images_n` 输入项，并在后台同时启动多个 `codex exec` 任务。
-- `images`：可选图片输入端口，类型为 ComfyUI `IMAGE`。可以从上游节点接入一张或一批图片。节点会把接入的图片保存到 ComfyUI 自身的 `input` 目录，再通过 Codex CLI 的 `--image` 参数传入。
-- `prompt_2` 到 `prompt_8`：并发任务 2 到 8 的提示词。只有当 `concurrency_count` 选到对应数量时才需要填写。
-- `images_2` 到 `images_8`：并发任务 2 到 8 的参考图输入。每组任务会使用自己的提示词和参考图独立执行。
+- `concurrency_count`：并发生成数量。可选 `1` 到 `8`，默认 `1`。所有任务共享同一个 prompt 和同一组参考媒体，适合一次生成多个变化版本。
+- `image_1` 到 `image_8`：可选图片输入端口，类型为 ComfyUI `IMAGE`。初始只显示 `image_1`；连接后自动显示下一个空端口，断开后会折叠未使用的末尾端口，最多显示 8 个。每个端口都可以接入单张图片或图片批次，因此实际可传入超过 8 张参考图。节点会将全部图片保存到 ComfyUI 自身的 `input` 目录，再通过 Codex CLI 的 `--image` 参数传入。为兼容旧工作流，`image_1` 的内部输入名仍为 `images`。
+- `audio`：可选 ComfyUI `AUDIO` 输入。GPT-5.6 不支持原生音频输入，因此节点会生成频谱图作为视觉参考，并明确告知模型只能使用节奏、频率和强度等可视信息，不能理解语音或音乐语义。
+- `video`：可选 ComfyUI `VIDEO` 输入。GPT-5.6 不支持原生视频输入，因此节点会按时间顺序最多抽取 4 个代表帧，作为图片参考传入。
 
 ![Concurrency workflow demo](docs/images/concurrency-demo.png)
 
-同时进行生图及参考生图工作：
-
-![Concurrent text and reference image workflow demo](docs/images/concurrent-text-and-reference-demo.png)
-
 - `aspect_ratio`：图片比例提示。可选 `none`、`1:1`、`16:9`、`9:16`、`4:3`、`3:4`、`3:2`、`2:3`，默认 `none`。该选项不会映射成 Codex CLI 参数，也不会添加 `--aspect-ratio`；选择具体比例时，只会在 prompt 中加入 `画面比例 <比例>`。
-- `model`：Codex 模型选择。可选 `gpt-5.4`、`gpt-5.5`，默认 `gpt-5.4`，用于映射 Codex CLI 的 `--model / -m`。
-- `reasoning_effort`：推理强度，映射 `-c model_reasoning_effort=<low|medium|high>`。可选 `low`、`medium`、`high`，默认 `medium`。
+- `model`：Codex 模型选择。可选 `gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`，默认 `gpt-5.6-sol`，用于映射 Codex CLI 的 `--model / -m`。Runner 仍接受旧工作流中的 `gpt-5.5` 和 `gpt-5.4`。
+- `reasoning_effort`：推理强度，映射 `-c model_reasoning_effort=<none|low|medium|high|xhigh|max>`，默认 `medium`。
 - `working_directory`：Codex 执行目录，映射 `--cd / -C`。为空时使用 ComfyUI 自身的 `output` 目录，便于生成图片直接进入 ComfyUI 输出目录；填写时必须是已存在目录。
 - `json_output`：是否启用 Codex CLI 的 `--json` 输出。启用后 stdout 会保存为 JSONL 文本并通过 `raw_jsonl` 输出。
 - `auto_save_to_output`：是否由本节点自动把生成图复制到 ComfyUI `output` 目录，默认关闭。通常建议关闭，并把 `generated_image` 接到 ComfyUI 自带的“保存图像”节点；否则会出现“本节点保存一张 + 保存图像节点再保存一张”的重复文件。打开后，`generated_image_path` 会返回复制到 `output` 的图片路径。
 - `output_last_message_path`：最终消息保存路径，映射 `--output-last-message / -o`。为空时写入本次任务目录下的 `last_message.txt`。
 - `skip_git_repo_check`：是否传入 `--skip-git-repo-check`。默认启用，方便在非 Git 目录中执行。
 - `ephemeral`：是否传入 `--ephemeral`。默认启用，使本次 Codex 执行不依赖长期会话状态。
+- `cache_mode`：`reuse` 会在全部输入不变时复用 ComfyUI 的上次结果；`always_run` 会每次重新调用 Codex。
 
 沙盒模式不在 UI 中暴露。节点内部固定使用 `--sandbox danger-full-access`，因为 `$imagegen` 通常需要网络访问和写入图片文件权限。
+
+## Codex Text 节点
+
+`Codex Text` 不添加 `$imagegen`，只返回 Codex 的文本回答。它支持与 ImageGen 相同的动态图片端口、AUDIO 频谱图和 VIDEO 抽帧输入，但不提供 `concurrency_count`、`aspect_ratio` 或图片输出。
+
+- `skill=auto`：原样发送用户 prompt。
+- 选择其他 Skill：发送 `$selected-skill`，然后发送用户 prompt。
+- `imagegen` 不会出现在 Text 节点的 Skill 列表中。
+- 输出为 `text`、`raw_jsonl`、`used_prompt`、`exit_code`、`success`。
+- Text 成功执行后会清理临时任务目录；失败时保留日志供诊断。
 
 ## 节点输出
 
@@ -227,6 +238,9 @@ python3 -m pytest -s tests/test_codex_node.py
 - Codex JSONL 事件到 ComfyUI 阶段式进度的映射
 - Codex CLI 不存在时返回结构化失败
 - ComfyUI 节点输入输出契约
+- SYSTEM／USER Skill 自动发现与显式调用
+- ImageGen 与 Text 模式的 prompt 分离
+- Codex Text 文本与诊断输出
 
 ## 常见问题
 

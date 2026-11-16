@@ -151,8 +151,8 @@
         301.82395755229277
       ],
       "size": [
-        254.615234375,
-        502
+        460,
+        520
       ],
       "flags": {},
       "order": 3,
@@ -160,12 +160,6 @@
       "inputs": [
         {
           "name": "images",
-          "shape": 7,
-          "type": "IMAGE",
-          "link": null
-        },
-        {
-          "name": "images_2",
           "shape": 7,
           "type": "IMAGE",
           "link": 12
@@ -215,24 +209,20 @@
         "Node name for S&R": "CodexExecImageGen"
       },
       "widgets_values": [
-        "2",
-        "一只猫，1:1",
         "图1人物换上图2的服饰",
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
+        "Keep the subjects' identity and overall appearance consistent.",
+        "auto",
+        "2",
         "none",
-        "gpt-5.4",
+        "gpt-5.6-sol",
         "medium",
         "",
         true,
         false,
         "",
         true,
-        true
+        true,
+        "reuse"
       ]
     },
     {
@@ -279,7 +269,7 @@
       15,
       0,
       13,
-      1,
+      0,
       "IMAGE"
     ],
     [
@@ -295,7 +285,7 @@
       13,
       0,
       16,
-      1,
+      0,
       "IMAGE"
     ]
   ],

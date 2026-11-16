@@ -7,30 +7,37 @@ from pathlib import Path
 try:
     from .codex_runner import CodexRunner
     from .image_io import empty_image_tensor, load_image_tensor_from_path
+    from .media_io import append_media_notes, prepare_media_references
     from .path_utils import cleanup_generated_source_image
     from .prompt_builder import ALLOWED_ASPECT_RATIOS
+    from .skill_registry import image_skill_options, validate_skill_selection
 except ImportError:
     from codex_runner import CodexRunner
     from image_io import empty_image_tensor, load_image_tensor_from_path
+    from media_io import append_media_notes, prepare_media_references
     from path_utils import cleanup_generated_source_image
     from prompt_builder import ALLOWED_ASPECT_RATIOS
+    from skill_registry import image_skill_options, validate_skill_selection
 
 
 MAX_CONCURRENCY = 8
 CONCURRENCY_OPTIONS = [str(value) for value in range(1, MAX_CONCURRENCY + 1)]
+MODEL_OPTIONS = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
+REASONING_EFFORT_OPTIONS = ["none", "low", "medium", "high", "xhigh", "max"]
+MAX_IMAGE_INPUTS = 8
 
 
 @dataclass(frozen=True)
 class _GenerationRequest:
     index: int
     prompt: str
+    instruction: str
     images: object | None
 
 
 class CodexExecImageGen:
     CATEGORY = "Codex/ImageGen"
     FUNCTION = "execute"
-    NOT_IDEMPOTENT = True
     OUTPUT_IS_LIST = (True, False, False, False, False, False, False)
     RETURN_TYPES = ("IMAGE", "STRING", "STRING", "STRING", "STRING", "INT", "BOOLEAN")
     RETURN_NAMES = (
@@ -47,42 +54,45 @@ class CodexExecImageGen:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "concurrency_count": (CONCURRENCY_OPTIONS, {"default": "1"}),
                 "prompt": ("STRING", {"multiline": True}),
+                "instruction": ("STRING", {"multiline": True, "default": ""}),
+                "skill": (image_skill_options(), {"default": "auto"}),
+                "concurrency_count": (CONCURRENCY_OPTIONS, {"default": "1"}),
+                "aspect_ratio": (list(ALLOWED_ASPECT_RATIOS), {"default": "none"}),
+                "model": (MODEL_OPTIONS, {"default": "gpt-5.6-sol"}),
+                "reasoning_effort": (REASONING_EFFORT_OPTIONS, {"default": "medium"}),
             },
             "optional": {
                 "images": ("IMAGE",),
                 **{
-                    f"prompt_{index}": ("STRING", {"multiline": True})
-                    for index in range(2, MAX_CONCURRENCY + 1)
+                    f"image_{index}": ("IMAGE",)
+                    for index in range(2, MAX_IMAGE_INPUTS + 1)
                 },
-                **{
-                    f"images_{index}": ("IMAGE",)
-                    for index in range(2, MAX_CONCURRENCY + 1)
-                },
-                "aspect_ratio": (list(ALLOWED_ASPECT_RATIOS), {"default": "none"}),
-                "model": (["gpt-5.4", "gpt-5.5"], {"default": "gpt-5.4"}),
-                "reasoning_effort": (["low", "medium", "high"], {"default": "medium"}),
+                "audio": ("AUDIO",),
+                "video": ("VIDEO",),
                 "working_directory": ("STRING", {"default": ""}),
                 "json_output": ("BOOLEAN", {"default": True}),
                 "auto_save_to_output": ("BOOLEAN", {"default": False}),
                 "output_last_message_path": ("STRING", {"default": ""}),
                 "skip_git_repo_check": ("BOOLEAN", {"default": True}),
                 "ephemeral": ("BOOLEAN", {"default": True}),
+                "cache_mode": (["reuse", "always_run"], {"default": "reuse"}),
             },
         }
 
     @classmethod
-    def IS_CHANGED(cls, *args, **kwargs):
-        return float("NaN")
+    def IS_CHANGED(cls, cache_mode="reuse", *args, **kwargs):
+        return float("NaN") if cache_mode == "always_run" else False
 
     def execute(
         self,
         prompt,
+        instruction="",
+        skill="auto",
         images=None,
         concurrency_count="1",
         aspect_ratio="none",
-        model="gpt-5.4",
+        model="gpt-5.6-sol",
         reasoning_effort="medium",
         working_directory="",
         json_output=True,
@@ -90,9 +100,25 @@ class CodexExecImageGen:
         output_last_message_path="",
         skip_git_repo_check=True,
         ephemeral=True,
+        cache_mode="reuse",
         **kwargs,
     ):
-        requests = _build_generation_requests(prompt, images, concurrency_count, kwargs)
+        selected_skill = validate_skill_selection(skill, allow_imagegen=True)
+        prepared_media = prepare_media_references(
+            [
+                images,
+                *[kwargs.get(f"image_{index}") for index in range(2, MAX_IMAGE_INPUTS + 1)],
+            ],
+            audio=kwargs.get("audio"),
+            video=kwargs.get("video"),
+        )
+        effective_prompt = append_media_notes(str(prompt), prepared_media.prompt_notes)
+        requests = _build_generation_requests(
+            effective_prompt,
+            prepared_media.image_inputs,
+            concurrency_count,
+            instruction=instruction,
+        )
         results = _run_generation_requests(
             requests,
             aspect_ratio=aspect_ratio,
@@ -104,24 +130,26 @@ class CodexExecImageGen:
             output_last_message_path=output_last_message_path,
             skip_git_repo_check=skip_git_repo_check,
             ephemeral=ephemeral,
+            skill=selected_skill,
         )
         return _build_node_output(results, auto_save_to_output)
 
 
-def _build_generation_requests(prompt, images, concurrency_count, kwargs) -> list[_GenerationRequest]:
+def _build_generation_requests(prompt, images, concurrency_count, instruction="") -> list[_GenerationRequest]:
     count = int(concurrency_count)
     if count < 1 or count > MAX_CONCURRENCY:
         raise ValueError(f"concurrency_count must be between 1 and {MAX_CONCURRENCY}.")
-
-    requests: list[_GenerationRequest] = []
-    for index in range(1, count + 1):
-        prompt_value = prompt if index == 1 else kwargs.get(f"prompt_{index}", "")
-        image_value = images if index == 1 else kwargs.get(f"images_{index}")
-        if not str(prompt_value or "").strip():
-            name = "prompt" if index == 1 else f"prompt_{index}"
-            raise ValueError(f"{name} is required when concurrency_count is {count}.")
-        requests.append(_GenerationRequest(index=index, prompt=str(prompt_value), images=image_value))
-    return requests
+    if not str(prompt or "").strip():
+        raise ValueError("prompt is required.")
+    return [
+        _GenerationRequest(
+            index=index,
+            prompt=str(prompt),
+            instruction=str(instruction or ""),
+            images=images,
+        )
+        for index in range(1, count + 1)
+    ]
 
 
 def _run_generation_requests(requests: list[_GenerationRequest], **options):
@@ -147,6 +175,9 @@ def _run_single_generation(request: _GenerationRequest, **options):
 
     result = CodexRunner().run(
         prompt=request.prompt,
+        instruction=request.instruction,
+        mode="imagegen",
+        skill=options["skill"],
         images=request.images,
         aspect_ratio=options["aspect_ratio"],
         model=options["model"],

@@ -20,6 +20,25 @@ def save_image_tensor_to_comfy_input(images, input_dir: Path, filename_prefix: s
     return saved
 
 
+def save_image_inputs_to_comfy_input(image_inputs, input_dir: Path, filename_prefix: str) -> list[Path]:
+    if image_inputs is None:
+        return []
+
+    values = image_inputs if isinstance(image_inputs, (list, tuple)) else [image_inputs]
+    saved: list[Path] = []
+    for input_index, images in enumerate(values, start=1):
+        if images is None:
+            continue
+        saved.extend(
+            save_image_tensor_to_comfy_input(
+                images,
+                input_dir,
+                f"{filename_prefix}_ref_{input_index:02d}",
+            )
+        )
+    return saved
+
+
 def load_image_tensor_from_path(image_path: str | Path):
     path = Path(image_path)
     if not path.exists():
